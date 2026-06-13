@@ -8,12 +8,12 @@ Target : Qwen/Qwen3-4B
 Draft  : z-lab/Qwen3-4B-DFlash-b16
 Dataset: gsm8k (a few prompts)
 
-For each prompt we decode twice with the SAME target model:
-  * baseline  : block_size=1  (ordinary autoregressive greedy decoding)
-  * dflash    : block_size=16 (block-diffusion speculative drafting + verify)
-We report decode speedup, mean acceptance length, and a losslessness check
-(under greedy decoding the DFlash output must match the baseline output token
-for token, since every drafted token is verified by the target).
+For each prompt we decode once at baseline (block_size=1, ordinary autoregressive
+greedy) and then sweep DFlash over block_size in [2, 4, 8, 16, 32] with the SAME
+draft, so we can map the speedup-vs-losslessness Pareto as a function of the
+verify-window size. For each block_size we report decode speedup, mean
+acceptance length, per-token agreement vs the baseline, and whether the output
+is bitwise identical to the baseline.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ DATASET = os.environ.get("DFLASH_DATASET", "gsm8k")
 MAX_SAMPLES = int(os.environ.get("DFLASH_MAX_SAMPLES", "20"))
 MAX_NEW_TOKENS = int(os.environ.get("DFLASH_MAX_NEW_TOKENS", "512"))
 TEMPERATURE = float(os.environ.get("DFLASH_TEMPERATURE", "0.0"))
+BLOCK_SIZES = [2, 4, 8, 16, 32]
 
 ART = Path(".openresearch/artifacts")
 ART.mkdir(parents=True, exist_ok=True)
@@ -76,8 +77,8 @@ def main() -> None:
         .to(device)
         .eval()
     )
-    block_size = draft.block_size
-    logger.info(f"draft.block_size={block_size}  target_layer_ids={draft.target_layer_ids}")
+    logger.info(f"draft.block_size={draft.block_size}  target_layer_ids={draft.target_layer_ids}  "
+                f"sweep_block_sizes={BLOCK_SIZES}")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     dataset = load_and_process_dataset(DATASET)[:MAX_SAMPLES]
@@ -87,7 +88,7 @@ def main() -> None:
         _apply_chat_template(tokenizer, [{"role": "user", "content": "Hi"}], False),
         return_tensors="pt",
     ).to(device)
-    for bs in (1, block_size):
+    for bs in [1, *BLOCK_SIZES]:
         dflash_generate(draft, target=target, input_ids=warm, max_new_tokens=8,
                         stop_token_ids=[tokenizer.eos_token_id], temperature=TEMPERATURE,
                         block_size=bs, return_stats=True)
@@ -101,86 +102,114 @@ def main() -> None:
         base = dflash_generate(draft, target=target, input_ids=input_ids,
                                max_new_tokens=MAX_NEW_TOKENS, stop_token_ids=[tokenizer.eos_token_id],
                                temperature=TEMPERATURE, block_size=1, return_stats=True)
-        spec = dflash_generate(draft, target=target, input_ids=input_ids,
-                               max_new_tokens=MAX_NEW_TOKENS, stop_token_ids=[tokenizer.eos_token_id],
-                               temperature=TEMPERATURE, block_size=block_size, return_stats=True)
-
         base_ids = base.output_ids[0, base.num_input_tokens:].tolist()
-        spec_ids = spec.output_ids[0, spec.num_input_tokens:].tolist()
-        n = min(len(base_ids), len(spec_ids))
-        # Longest common prefix: how far DFlash tracks the token-by-token baseline.
-        lcp = 0
-        for a, b in zip(base_ids, spec_ids):
-            if a != b:
-                break
-            lcp += 1
-        # Aligned per-token agreement over the shared length.
-        agree = sum(1 for a, b in zip(base_ids[:n], spec_ids[:n]) if a == b)
-        exact_match = base_ids == spec_ids
-        first_div = lcp if lcp < n else (n if len(base_ids) == len(spec_ids) else n)
 
-        speedup = base.time_per_output_token / spec.time_per_output_token
-        mean_acc = float(np.mean(spec.acceptance_lengths))
-        row = {
-            "idx": i,
-            "baseline_tpot_ms": round(base.time_per_output_token * 1e3, 3),
-            "dflash_tpot_ms": round(spec.time_per_output_token * 1e3, 3),
-            "decode_speedup": round(speedup, 3),
-            "mean_acceptance_length": round(mean_acc, 3),
-            "baseline_tokens": len(base_ids),
-            "dflash_tokens": len(spec_ids),
-            "exact_match": exact_match,
-            "token_agreement": round(agree / max(1, n), 4),
-            "lcp_frac": round(lcp / max(1, n), 4),
-            "first_divergence_idx": first_div,
-        }
-        rows.append(row)
-        logger.info(f"[{i}] speedup={speedup:.2f}x  acc_len={mean_acc:.2f}  "
-                    f"token_agree={agree / max(1, n):.3f}  first_div={first_div}/{n}")
+        for bs in BLOCK_SIZES:
+            spec = dflash_generate(draft, target=target, input_ids=input_ids,
+                                   max_new_tokens=MAX_NEW_TOKENS,
+                                   stop_token_ids=[tokenizer.eos_token_id],
+                                   temperature=TEMPERATURE, block_size=bs, return_stats=True)
+            spec_ids = spec.output_ids[0, spec.num_input_tokens:].tolist()
+            n = min(len(base_ids), len(spec_ids))
+            # Longest common prefix: how far DFlash tracks the token-by-token baseline.
+            lcp = 0
+            for a, b in zip(base_ids, spec_ids):
+                if a != b:
+                    break
+                lcp += 1
+            # Aligned per-token agreement over the shared length.
+            agree = sum(1 for a, b in zip(base_ids[:n], spec_ids[:n]) if a == b)
+            exact_match = base_ids == spec_ids
+            first_div = lcp if lcp < n else (n if len(base_ids) == len(spec_ids) else n)
+
+            speedup = base.time_per_output_token / spec.time_per_output_token
+            mean_acc = float(np.mean(spec.acceptance_lengths))
+            row = {
+                "idx": i,
+                "block_size": bs,
+                "baseline_tpot_ms": round(base.time_per_output_token * 1e3, 3),
+                "dflash_tpot_ms": round(spec.time_per_output_token * 1e3, 3),
+                "decode_speedup": round(speedup, 3),
+                "mean_acceptance_length": round(mean_acc, 3),
+                "baseline_tokens": len(base_ids),
+                "dflash_tokens": len(spec_ids),
+                "exact_match": exact_match,
+                "token_agreement": round(agree / max(1, n), 4),
+                "lcp_frac": round(lcp / max(1, n), 4),
+                "first_divergence_idx": first_div,
+            }
+            rows.append(row)
+            logger.info(f"[{i}] bs={bs:>2}  speedup={speedup:.2f}x  acc_len={mean_acc:.2f}  "
+                        f"token_agree={agree / max(1, n):.3f}  first_div={first_div}/{n}")
 
     with open(ART / "samples.jsonl", "w") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
 
-    base_tpot = float(np.mean([r["baseline_tpot_ms"] for r in rows]))
-    spec_tpot = float(np.mean([r["dflash_tpot_ms"] for r in rows]))
-    speedup = base_tpot / spec_tpot
-    mean_acc = float(np.mean([r["mean_acceptance_length"] for r in rows]))
-    exact_frac = float(np.mean([1.0 if r["exact_match"] else 0.0 for r in rows]))
-    mean_agree = float(np.mean([r["token_agreement"] for r in rows]))
-    mean_lcp = float(np.mean([r["lcp_frac"] for r in rows]))
+    # Per-block_size aggregation.
+    base_tpot = float(np.mean([r["baseline_tpot_ms"] for r in rows if r["block_size"] == BLOCK_SIZES[0]]))
     base_tps = 1e3 / base_tpot
-    spec_tps = 1e3 / spec_tpot
 
+    summary = []
+    for bs in BLOCK_SIZES:
+        bs_rows = [r for r in rows if r["block_size"] == bs]
+        spec_tpot = float(np.mean([r["dflash_tpot_ms"] for r in bs_rows]))
+        speedup = base_tpot / spec_tpot
+        mean_acc = float(np.mean([r["mean_acceptance_length"] for r in bs_rows]))
+        exact_frac = float(np.mean([1.0 if r["exact_match"] else 0.0 for r in bs_rows]))
+        mean_agree = float(np.mean([r["token_agreement"] for r in bs_rows]))
+        mean_lcp = float(np.mean([r["lcp_frac"] for r in bs_rows]))
+        spec_tps = 1e3 / spec_tpot
+        summary.append({
+            "block_size": bs,
+            "dflash_tps": spec_tps,
+            "decode_speedup": speedup,
+            "mean_acceptance_length": mean_acc,
+            "token_agreement": mean_agree,
+            "lcp_frac": mean_lcp,
+            "exact_match_frac": exact_frac,
+        })
+
+    with open(ART / "summary.jsonl", "w") as f:
+        for s in summary:
+            f.write(json.dumps(s) + "\n")
+
+    header = ("| block_size | DFlash tok/s | Decode speedup | Mean acc. length | "
+             "Token agreement | Common-prefix frac | Bitwise identical |\n"
+             "|---|---|---|---|---|---|---|\n")
+    table_rows = "\n".join(
+        f"| {s['block_size']} | {s['dflash_tps']:.1f} | {s['decode_speedup']:.2f}x | "
+        f"{s['mean_acceptance_length']:.2f} | {s['token_agreement'] * 100:.2f}% | "
+        f"{s['lcp_frac'] * 100:.2f}% | {s['exact_match_frac'] * 100:.0f}% |"
+        for s in summary
+    )
+
+    n_prompts = len({r["idx"] for r in rows})
     md = f"""# DFlash PoC: {MODEL} + {DRAFT}
 
-Backend: Transformers ({attn}) | Dataset: {DATASET} | Samples: {len(rows)} | \
-block_size: {block_size} | temperature: {TEMPERATURE} | max_new_tokens: {MAX_NEW_TOKENS}
+Backend: Transformers ({attn}) | Dataset: {DATASET} | Prompts: {n_prompts} | \
+block_size sweep: {BLOCK_SIZES} | temperature: {TEMPERATURE} | max_new_tokens: {MAX_NEW_TOKENS}
 
-## Core claim: lossless multi-token speculative acceleration
+Baseline (AR, block_size=1) throughput: **{base_tps:.1f} tok/s**
 
-| Metric | Value |
-|---|---|
-| Baseline (AR) throughput | {base_tps:.1f} tok/s |
-| DFlash throughput | {spec_tps:.1f} tok/s |
-| **Decode speedup** | **{speedup:.2f}x** |
-| **Mean acceptance length** (of {block_size}) | **{mean_acc:.2f}** |
-| Token agreement vs baseline | {mean_agree * 100:.2f}% |
-| Mean common-prefix fraction | {mean_lcp * 100:.2f}% |
-| Bitwise-identical outputs | {exact_frac * 100:.0f}% of samples |
+## Speedup vs losslessness Pareto across block_size
 
-- Both decoders use the same frozen target {MODEL}; only the drafting differs.
-- Acceptance length = mean tokens accepted per target forward pass. >1 means
-  the block-diffusion draft proposed multiple correct tokens at once.
+{header}{table_rows}
+
+- Both decoders use the same frozen target {MODEL} and the same draft {DRAFT}
+  (trained with block_size=16); only the verify-window `block_size` passed to
+  `dflash_generate` is swept.
+- Acceptance length = mean tokens accepted per target forward pass. It is
+  upper-bounded by `block_size`, so larger `block_size` can amortize more
+  target forwards if the draft stays accurate.
 - Losslessness: DFlash's verify step accepts a drafted token only if it equals
-  the token the target itself would emit, so the output matches the target's
-  greedy decode within the same numerical regime. The baseline here decodes one
-  token at a time, while DFlash verifies a block in a single batched forward;
-  batched-vs-sequential floating-point differences flip an occasional argmax,
-  which ends the common prefix. Token agreement stays near 100%, confirming the
-  divergences are isolated fp flips, not quality loss.
+  the token the target itself would emit, so divergences vs the AR baseline
+  come from batched-vs-sequential floating-point differences flipping an
+  occasional argmax. This sweep shows how those divergences (token agreement,
+  common-prefix fraction, bitwise-identical fraction) evolve with the verify
+  window, giving a principled basis for choosing the default `block_size`.
 
-Per-sample numbers in `samples.jsonl`.
+Per-sample numbers in `samples.jsonl`; per-block_size aggregates in `summary.jsonl`.
 """
     (ART / "EVAL.md").write_text(md)
     print(md)
