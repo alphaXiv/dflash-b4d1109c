@@ -43,13 +43,19 @@ ART.mkdir(parents=True, exist_ok=True)
 
 
 def _attn_impl() -> str:
-    try:
-        import flash_attn  # noqa: F401
-
-        return "flash_attention_2"
-    except ImportError:
-        logger.warning("flash_attn not installed; using sdpa (lower absolute speedup).")
-        return "sdpa"
+    # Default to sdpa: FlashAttention-2 uses non-deterministic reductions that
+    # can perturb argmax ties under greedy decoding, breaking the token-for-token
+    # losslessness check even though DFlash is lossless by construction. sdpa
+    # gives deterministic reductions and should recover ~100% match. Override
+    # with DFLASH_ATTN_IMPL=flash_attention_2 to restore the old behavior.
+    impl = os.environ.get("DFLASH_ATTN_IMPL", "sdpa")
+    if impl == "flash_attention_2":
+        try:
+            import flash_attn  # noqa: F401
+        except ImportError:
+            logger.warning("flash_attn not installed; falling back to sdpa.")
+            return "sdpa"
+    return impl
 
 
 def main() -> None:
