@@ -4,8 +4,8 @@ Demonstrates the paper's core claim on the smallest released Transformers-backen
 config: a lightweight block-diffusion draft model gives lossless multi-token
 acceleration over plain autoregressive decoding.
 
-Target : Qwen/Qwen3-4B
-Draft  : z-lab/Qwen3-4B-DFlash-b16
+Target : Qwen/Qwen3-8B
+Draft  : z-lab/Qwen3-8B-DFlash-b16
 Dataset: gsm8k (a few prompts)
 
 For each prompt we decode twice with the SAME target model:
@@ -31,8 +31,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from dflash.benchmark import _apply_chat_template, load_and_process_dataset
 from dflash.model import DFlashDraftModel, dflash_generate
 
-MODEL = os.environ.get("DFLASH_MODEL", "Qwen/Qwen3-4B")
-DRAFT = os.environ.get("DFLASH_DRAFT", "z-lab/Qwen3-4B-DFlash-b16")
+MODEL = os.environ.get("DFLASH_MODEL", "Qwen/Qwen3-8B")
+DRAFT = os.environ.get("DFLASH_DRAFT", "z-lab/Qwen3-8B-DFlash-b16")
 DATASET = os.environ.get("DFLASH_DATASET", "gsm8k")
 MAX_SAMPLES = int(os.environ.get("DFLASH_MAX_SAMPLES", "20"))
 MAX_NEW_TOKENS = int(os.environ.get("DFLASH_MAX_NEW_TOKENS", "512"))
