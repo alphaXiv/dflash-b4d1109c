@@ -501,6 +501,36 @@ def stream_generate(
                     draft_cache,
                     logits_start=1,
                 )
+
+                # Two-step iterative unmasking: keep the most confident draft
+                # predictions, re-mask the rest, then run the draft a second
+                # pass before verification. The first pass advanced the cache
+                # by hidden.shape[1] context positions, so rewind that here
+                # before the second pass re-adds them.
+                _trim_recent_cache(draft_cache, hidden.shape[1])
+                probs = mx.softmax(draft_logits, axis=-1)
+                draft_argmax = mx.argmax(probs, axis=-1)
+                n_keep = max(1, (bs - 1) // 2)
+                n_mask_pos = (bs - 1) - n_keep
+                if n_mask_pos > 0:
+                    confidences = mx.max(probs, axis=-1)
+                    rank = mx.argsort(mx.argsort(confidences, axis=-1), axis=-1)
+                    refilled = mx.where(
+                        rank >= n_mask_pos,
+                        draft_argmax,
+                        mx.array(mask_id, dtype=draft_argmax.dtype),
+                    )
+                else:
+                    refilled = draft_argmax
+                first_tok = mx.array([[tokens[-1]]], dtype=refilled.dtype)
+                block = mx.concatenate([first_tok, refilled], axis=1)
+                draft_logits = draft(
+                    block,
+                    hidden,
+                    draft_cache,
+                    logits_start=1,
+                )
+
                 if (trim_n := draft_cache[0].offset - (prompt.size + n - 1)) > 0:
                     _trim_recent_cache(draft_cache, trim_n)
                 draft_tokens = sampler(draft_logits)
