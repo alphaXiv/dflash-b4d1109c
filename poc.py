@@ -101,11 +101,19 @@ def main() -> None:
         base = dflash_generate(draft, target=target, input_ids=input_ids,
                                max_new_tokens=MAX_NEW_TOKENS, stop_token_ids=[tokenizer.eos_token_id],
                                temperature=TEMPERATURE, block_size=1, return_stats=True)
+        # Noise floor: re-run the baseline with the same block_size=1 to measure
+        # how much flash-attention 2 disagrees with itself across kernels/batch
+        # shapes. Any base-vs-spec gap above this floor is true DFlash drafting
+        # error; anything at or below it is just non-deterministic fp drift.
+        base2 = dflash_generate(draft, target=target, input_ids=input_ids,
+                                max_new_tokens=MAX_NEW_TOKENS, stop_token_ids=[tokenizer.eos_token_id],
+                                temperature=TEMPERATURE, block_size=1, return_stats=True)
         spec = dflash_generate(draft, target=target, input_ids=input_ids,
                                max_new_tokens=MAX_NEW_TOKENS, stop_token_ids=[tokenizer.eos_token_id],
                                temperature=TEMPERATURE, block_size=block_size, return_stats=True)
 
         base_ids = base.output_ids[0, base.num_input_tokens:].tolist()
+        base2_ids = base2.output_ids[0, base2.num_input_tokens:].tolist()
         spec_ids = spec.output_ids[0, spec.num_input_tokens:].tolist()
         n = min(len(base_ids), len(spec_ids))
         # Longest common prefix: how far DFlash tracks the token-by-token baseline.
@@ -118,6 +126,16 @@ def main() -> None:
         agree = sum(1 for a, b in zip(base_ids[:n], spec_ids[:n]) if a == b)
         exact_match = base_ids == spec_ids
         first_div = lcp if lcp < n else (n if len(base_ids) == len(spec_ids) else n)
+
+        # Baseline-vs-baseline noise floor (same recipe, base_ids vs base2_ids).
+        n_bb = min(len(base_ids), len(base2_ids))
+        lcp_bb = 0
+        for a, b in zip(base_ids, base2_ids):
+            if a != b:
+                break
+            lcp_bb += 1
+        agree_bb = sum(1 for a, b in zip(base_ids[:n_bb], base2_ids[:n_bb]) if a == b)
+        exact_match_bb = base_ids == base2_ids
 
         speedup = base.time_per_output_token / spec.time_per_output_token
         mean_acc = float(np.mean(spec.acceptance_lengths))
@@ -133,10 +151,14 @@ def main() -> None:
             "token_agreement": round(agree / max(1, n), 4),
             "lcp_frac": round(lcp / max(1, n), 4),
             "first_divergence_idx": first_div,
+            "base_vs_base_exact_match": exact_match_bb,
+            "base_vs_base_token_agreement": round(agree_bb / max(1, n_bb), 4),
+            "base_vs_base_lcp_frac": round(lcp_bb / max(1, n_bb), 4),
         }
         rows.append(row)
         logger.info(f"[{i}] speedup={speedup:.2f}x  acc_len={mean_acc:.2f}  "
-                    f"token_agree={agree / max(1, n):.3f}  first_div={first_div}/{n}")
+                    f"token_agree={agree / max(1, n):.3f}  first_div={first_div}/{n}  "
+                    f"base_vs_base_agree={agree_bb / max(1, n_bb):.3f}")
 
     with open(ART / "samples.jsonl", "w") as f:
         for r in rows:
@@ -149,6 +171,9 @@ def main() -> None:
     exact_frac = float(np.mean([1.0 if r["exact_match"] else 0.0 for r in rows]))
     mean_agree = float(np.mean([r["token_agreement"] for r in rows]))
     mean_lcp = float(np.mean([r["lcp_frac"] for r in rows]))
+    exact_frac_bb = float(np.mean([1.0 if r["base_vs_base_exact_match"] else 0.0 for r in rows]))
+    mean_agree_bb = float(np.mean([r["base_vs_base_token_agreement"] for r in rows]))
+    mean_lcp_bb = float(np.mean([r["base_vs_base_lcp_frac"] for r in rows]))
     base_tps = 1e3 / base_tpot
     spec_tps = 1e3 / spec_tpot
 
@@ -168,6 +193,9 @@ block_size: {block_size} | temperature: {TEMPERATURE} | max_new_tokens: {MAX_NEW
 | Token agreement vs baseline | {mean_agree * 100:.2f}% |
 | Mean common-prefix fraction | {mean_lcp * 100:.2f}% |
 | Bitwise-identical outputs | {exact_frac * 100:.0f}% of samples |
+| Noise floor: baseline-vs-baseline token agreement | {mean_agree_bb * 100:.2f}% |
+| Noise floor: baseline-vs-baseline common-prefix fraction | {mean_lcp_bb * 100:.2f}% |
+| Noise floor: baseline-vs-baseline bitwise-identical | {exact_frac_bb * 100:.0f}% of samples |
 
 - Both decoders use the same frozen target {MODEL}; only the drafting differs.
 - Acceptance length = mean tokens accepted per target forward pass. >1 means
