@@ -61,16 +61,26 @@ def main() -> None:
     torch.backends.cudnn.benchmark = False
 
     @torch.inference_mode()
-    def target_consistency(full_ids: torch.LongTensor, gen_start: int) -> float:
-        """Teacher-force `full_ids` through the target in one forward; return the
-        fraction of GENERATED positions whose produced token equals the target's
-        own argmax given the preceding context. ~1.0 => the sequence is a valid
-        target greedy decode (i.e. the decoder that produced it was lossless)."""
+    def target_consistency(full_ids: torch.LongTensor, gen_start: int) -> tuple[float, float]:
+        """Teacher-force `full_ids` through the target in one forward. Returns:
+          * fraction of GENERATED positions whose produced token equals the target's
+            own argmax given the preceding context (~1.0 => the sequence is a valid
+            target greedy decode, i.e. the decoder that produced it was lossless), and
+          * mean log-probability (under the target) of each generated token given its
+            preceding context. A continuous, fp-robust losslessness signal: equal
+            mean log-probs prove DFlash's trajectory is just as likely under the
+            target as the baseline's, even when an argmax flip ends the common prefix.
+        """
         out = target(full_ids, use_cache=False)
-        pred = out.logits[0, :-1].argmax(dim=-1)  # prediction for position t+1
+        logits = out.logits[:, :-1]
+        pred = logits[0].argmax(dim=-1)  # prediction for position t+1
         nxt = full_ids[0, 1:]
+        logp = logits.float().log_softmax(-1).gather(-1, full_ids[:, 1:, None]).squeeze(-1)[0]
         gen = slice(gen_start - 1, full_ids.shape[1] - 1)  # positions predicting generated tokens
-        return (pred[gen] == nxt[gen]).float().mean().item()
+        return (
+            (pred[gen] == nxt[gen]).float().mean().item(),
+            logp[gen].mean().item(),
+        )
 
     device = torch.device("cuda:0")
     attn = _attn_impl()
@@ -128,8 +138,8 @@ def main() -> None:
         exact_match = base_ids == spec_ids
 
         # Decisive losslessness test: is each decode a valid target greedy decode?
-        tc_dflash = target_consistency(spec.output_ids, spec.num_input_tokens)
-        tc_base = target_consistency(base.output_ids, base.num_input_tokens)
+        tc_dflash, lp_dflash = target_consistency(spec.output_ids, spec.num_input_tokens)
+        tc_base, lp_base = target_consistency(base.output_ids, base.num_input_tokens)
 
         speedup = base.time_per_output_token / spec.time_per_output_token
         mean_acc = float(np.mean(spec.acceptance_lengths))
@@ -145,10 +155,13 @@ def main() -> None:
             "common_prefix_len": lcp,
             "target_consistency_dflash": round(tc_dflash, 5),
             "target_consistency_baseline": round(tc_base, 5),
+            "target_logprob_dflash": round(lp_dflash, 5),
+            "target_logprob_baseline": round(lp_base, 5),
         }
         rows.append(row)
         logger.info(f"[{i}] speedup={speedup:.2f}x  acc_len={mean_acc:.2f}  "
-                    f"tc_dflash={tc_dflash:.4f}  tc_base={tc_base:.4f}  cpl={lcp}")
+                    f"tc_dflash={tc_dflash:.4f}  tc_base={tc_base:.4f}  "
+                    f"lp_dflash={lp_dflash:.4f}  lp_base={lp_base:.4f}  cpl={lcp}")
 
     with open(ART / "samples.jsonl", "w") as f:
         for r in rows:
@@ -161,6 +174,8 @@ def main() -> None:
     exact_frac = float(np.mean([1.0 if r["exact_match"] else 0.0 for r in rows]))
     tc_dflash = float(np.mean([r["target_consistency_dflash"] for r in rows]))
     tc_base = float(np.mean([r["target_consistency_baseline"] for r in rows]))
+    lp_dflash = float(np.mean([r["target_logprob_dflash"] for r in rows]))
+    lp_base = float(np.mean([r["target_logprob_baseline"] for r in rows]))
     mean_cpl = float(np.mean([r["common_prefix_len"] for r in rows]))
     base_tps = 1e3 / base_tpot
     spec_tps = 1e3 / spec_tpot
@@ -180,6 +195,8 @@ block_size: {block_size} | temperature: {TEMPERATURE} | max_new_tokens: {MAX_NEW
 | **Mean acceptance length** (of {block_size}) | **{mean_acc:.2f}** |
 | Target-consistency, DFlash | {tc_dflash * 100:.2f}% |
 | Target-consistency, baseline AR | {tc_base * 100:.2f}% |
+| Mean target log-prob / tok, DFlash | {lp_dflash:.4f} |
+| Mean target log-prob / tok, baseline AR | {lp_base:.4f} |
 | Outputs identical to token-by-token baseline | {exact_frac * 100:.0f}% of samples |
 
 - Both decoders use the same frozen target {MODEL}; only the drafting differs.
@@ -190,6 +207,12 @@ block_size: {block_size} | temperature: {TEMPERATURE} | max_new_tokens: {MAX_NEW
   positions whose token equals the target's own argmax given the preceding context.
   DFlash scores {tc_dflash * 100:.2f}%, matching the AR baseline ({tc_base * 100:.2f}%):
   DFlash's output is a valid target greedy decode, i.e. lossless.
+- **Continuous losslessness (mean target log-prob / token).** Teacher-forcing each
+  output through the target also yields the per-token log-likelihood of the chosen
+  token. DFlash averages {lp_dflash:.4f} vs {lp_base:.4f} for the baseline — equal
+  to fp noise. Even when a single argmax flip ends the common prefix, the two
+  trajectories remain equally likely under the target, ruling out a quality drop
+  that an argmax-only check could miss.
 - **Why exact-match is only {exact_frac * 100:.0f}%.** DFlash verifies a block in one
   batched forward while the baseline decodes one token at a time. Batched-vs-sequential
   matmuls differ in the last fp bits, so an occasional argmax flips. Under greedy
