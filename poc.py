@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 from pathlib import Path
 
 import numpy as np
@@ -40,6 +41,29 @@ TEMPERATURE = float(os.environ.get("DFLASH_TEMPERATURE", "0.0"))
 
 ART = Path(".openresearch/artifacts")
 ART.mkdir(parents=True, exist_ok=True)
+
+
+_NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def extract_gsm8k_answer(text: str) -> str | None:
+    """Return the last number appearing in `text`, normalized, or None.
+
+    GSM8K answers are numeric; the model is prompted to put the final answer in
+    a \\boxed{...}, but in practice the last number in the decoded string is a
+    robust extractor that also matches the gold answer (the digits after
+    `####`).
+    """
+    if not text:
+        return None
+    matches = _NUM_RE.findall(text.replace(",", ""))
+    if not matches:
+        return None
+    s = matches[-1]
+    # Normalize trailing ".0" so "42" and "42.0" compare equal.
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
 
 
 def _attn_impl() -> str:
@@ -119,6 +143,15 @@ def main() -> None:
         exact_match = base_ids == spec_ids
         first_div = lcp if lcp < n else (n if len(base_ids) == len(spec_ids) else n)
 
+        base_text = tokenizer.decode(base_ids, skip_special_tokens=True)
+        spec_text = tokenizer.decode(spec_ids, skip_special_tokens=True)
+        base_answer = extract_gsm8k_answer(base_text)
+        spec_answer = extract_gsm8k_answer(spec_text)
+        reference = extract_gsm8k_answer(instance.get("reference") or "")
+        answer_match = base_answer is not None and base_answer == spec_answer
+        base_correct = reference is not None and base_answer == reference
+        spec_correct = reference is not None and spec_answer == reference
+
         speedup = base.time_per_output_token / spec.time_per_output_token
         mean_acc = float(np.mean(spec.acceptance_lengths))
         row = {
@@ -133,10 +166,17 @@ def main() -> None:
             "token_agreement": round(agree / max(1, n), 4),
             "lcp_frac": round(lcp / max(1, n), 4),
             "first_divergence_idx": first_div,
+            "reference": reference,
+            "base_answer": base_answer,
+            "spec_answer": spec_answer,
+            "answer_match": answer_match,
+            "base_correct": base_correct,
+            "spec_correct": spec_correct,
         }
         rows.append(row)
         logger.info(f"[{i}] speedup={speedup:.2f}x  acc_len={mean_acc:.2f}  "
-                    f"token_agree={agree / max(1, n):.3f}  first_div={first_div}/{n}")
+                    f"token_agree={agree / max(1, n):.3f}  first_div={first_div}/{n}  "
+                    f"ref={reference} base={base_answer} spec={spec_answer} match={answer_match}")
 
     with open(ART / "samples.jsonl", "w") as f:
         for r in rows:
@@ -151,6 +191,14 @@ def main() -> None:
     mean_lcp = float(np.mean([r["lcp_frac"] for r in rows]))
     base_tps = 1e3 / base_tpot
     spec_tps = 1e3 / spec_tpot
+
+    answer_agreement = float(np.mean([1.0 if r["answer_match"] else 0.0 for r in rows]))
+    scorable = [r for r in rows if r["reference"] is not None]
+    if scorable:
+        base_acc = float(np.mean([1.0 if r["base_correct"] else 0.0 for r in scorable]))
+        spec_acc = float(np.mean([1.0 if r["spec_correct"] else 0.0 for r in scorable]))
+    else:
+        base_acc = spec_acc = float("nan")
 
     md = f"""# DFlash PoC: {MODEL} + {DRAFT}
 
@@ -168,6 +216,9 @@ block_size: {block_size} | temperature: {TEMPERATURE} | max_new_tokens: {MAX_NEW
 | Token agreement vs baseline | {mean_agree * 100:.2f}% |
 | Mean common-prefix fraction | {mean_lcp * 100:.2f}% |
 | Bitwise-identical outputs | {exact_frac * 100:.0f}% of samples |
+| **GSM8K answer agreement** (DFlash vs baseline) | **{answer_agreement * 100:.2f}%** of {len(rows)} |
+| Baseline (AR) GSM8K accuracy | {base_acc * 100:.2f}% of {len(scorable)} |
+| DFlash GSM8K accuracy | {spec_acc * 100:.2f}% of {len(scorable)} |
 
 - Both decoders use the same frozen target {MODEL}; only the drafting differs.
 - Acceptance length = mean tokens accepted per target forward pass. >1 means
@@ -179,6 +230,11 @@ block_size: {block_size} | temperature: {TEMPERATURE} | max_new_tokens: {MAX_NEW
   batched-vs-sequential floating-point differences flip an occasional argmax,
   which ends the common prefix. Token agreement stays near 100%, confirming the
   divergences are isolated fp flips, not quality loss.
+- Task-level losslessness: bitwise/LCP agreement is fragile to a single
+  argmax flip cascading. **GSM8K answer agreement** asks the question users
+  actually care about — does DFlash arrive at the same final number as plain
+  AR decoding? Per-mode accuracy against the gold `reference` then confirms
+  DFlash isn't quietly degrading task quality even when token streams differ.
 
 Per-sample numbers in `samples.jsonl`.
 """

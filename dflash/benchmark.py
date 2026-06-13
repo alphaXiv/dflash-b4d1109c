@@ -30,6 +30,7 @@ DATASETS = {
         "load_args": ("openai/gsm8k", "main"),
         "load_kwargs": {"split": "test"},
         "format": lambda x: "{question}\nPlease reason step by step, and put your final answer within \\boxed{{}}.".format(**x),
+        "reference": lambda x: x["answer"].split("####")[-1].strip() if "####" in x.get("answer", "") else None,
     },
     "math500": {
         "load_args": ("HuggingFaceH4/MATH-500",),
@@ -66,13 +67,15 @@ def _prepare_dataset(name: str) -> Path:
     print(f"[download] {name} ...")
     dataset = load_dataset(*cfg["load_args"], **cfg["load_kwargs"])
 
+    ref_fn = cfg.get("reference")
     with open(tmp_path, "w") as f:
         for row in dataset:
             if cfg.get("multi_turn"):
                 turns = cfg["format"](row)
             else:
                 turns = [cfg["format"](row)]
-            f.write(json.dumps({"turns": turns}) + "\n")
+            record = {"turns": turns, "reference": ref_fn(row) if ref_fn else None}
+            f.write(json.dumps(record) + "\n")
     os.replace(tmp_path, out_path)
 
     with open(out_path) as f:
@@ -90,7 +93,13 @@ def load_and_process_dataset(data_name: str) -> list[dict]:
         _prepare_dataset(data_name)
 
     with open(path) as f:
-        return [json.loads(line) for line in f]
+        rows = [json.loads(line) for line in f]
+    # Re-prepare older caches that predate the `reference` field.
+    if rows and "reference" not in rows[0] and DATASETS[data_name].get("reference"):
+        _prepare_dataset(data_name)
+        with open(path) as f:
+            rows = [json.loads(line) for line in f]
+    return rows
 
 
 def _limit_dataset(dataset: list[dict], max_samples: int | None) -> list[dict]:
