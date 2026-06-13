@@ -47,7 +47,7 @@ def extract_context_feature(
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     if temperature < 1e-5:
-        return torch.argmax(logits, dim=-1)
+        return torch.argmax(logits.float(), dim=-1)
     bsz, seq_len, vocab_size = logits.shape
     logits = logits.view(-1, vocab_size) / temperature
     probs = torch.softmax(logits, dim=-1)
