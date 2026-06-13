@@ -8,12 +8,16 @@ Target : Qwen/Qwen3-4B
 Draft  : z-lab/Qwen3-4B-DFlash-b16
 Dataset: gsm8k (a few prompts)
 
-For each prompt we decode twice with the SAME target model:
-  * baseline  : block_size=1  (ordinary autoregressive greedy decoding)
-  * dflash    : block_size=16 (block-diffusion speculative drafting + verify)
-We report decode speedup, mean acceptance length, and a losslessness check
-(under greedy decoding the DFlash output must match the baseline output token
-for token, since every drafted token is verified by the target).
+For each prompt we decode the SAME target model under a configurable sweep of
+inference-time draft block sizes (``DFLASH_BLOCK_SIZES``, default
+``"1,4,8,12,16"``). ``block_size=1`` is plain autoregressive greedy decoding
+and acts as the baseline; the other sizes invoke block-diffusion speculative
+drafting + verify against the same b16 draft. The verifier accepts any
+``block_size <= draft.block_size``, so this sweep characterises the throughput
+vs. acceptance-length curve and identifies the practical sweet spot rather
+than only the trained default of 16. We report per-block-size decode speedup,
+mean acceptance length, and a losslessness check (under greedy decoding every
+DFlash output must match the baseline output token for token).
 """
 
 from __future__ import annotations
@@ -37,6 +41,9 @@ DATASET = os.environ.get("DFLASH_DATASET", "gsm8k")
 MAX_SAMPLES = int(os.environ.get("DFLASH_MAX_SAMPLES", "20"))
 MAX_NEW_TOKENS = int(os.environ.get("DFLASH_MAX_NEW_TOKENS", "512"))
 TEMPERATURE = float(os.environ.get("DFLASH_TEMPERATURE", "0.0"))
+BLOCK_SIZES = [
+    int(s) for s in os.environ.get("DFLASH_BLOCK_SIZES", "1,4,8,12,16").split(",") if s.strip()
+]
 
 ART = Path(".openresearch/artifacts")
 ART.mkdir(parents=True, exist_ok=True)
@@ -76,8 +83,24 @@ def main() -> None:
         .to(device)
         .eval()
     )
-    block_size = draft.block_size
-    logger.info(f"draft.block_size={block_size}  target_layer_ids={draft.target_layer_ids}")
+    draft_block_size = draft.block_size
+    logger.info(f"draft.block_size={draft_block_size}  target_layer_ids={draft.target_layer_ids}")
+
+    # Validate sweep against the draft's maximum block size and ensure baseline=1
+    # is included so we have something to measure speedups against.
+    if not BLOCK_SIZES:
+        raise ValueError("DFLASH_BLOCK_SIZES must contain at least one positive integer")
+    for bs in BLOCK_SIZES:
+        if bs < 1:
+            raise ValueError(f"block_size must be >= 1, got {bs}")
+        if bs > draft_block_size:
+            raise ValueError(
+                f"block_size={bs} exceeds draft.block_size={draft_block_size}; "
+                f"dflash_generate only accepts block_size <= model.block_size"
+            )
+    if 1 not in BLOCK_SIZES:
+        raise ValueError("DFLASH_BLOCK_SIZES must include 1 (used as the AR baseline)")
+    logger.info(f"Sweeping block_sizes={BLOCK_SIZES} against draft b{draft_block_size}")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     dataset = load_and_process_dataset(DATASET)[:MAX_SAMPLES]
@@ -87,7 +110,7 @@ def main() -> None:
         _apply_chat_template(tokenizer, [{"role": "user", "content": "Hi"}], False),
         return_tensors="pt",
     ).to(device)
-    for bs in (1, block_size):
+    for bs in BLOCK_SIZES:
         dflash_generate(draft, target=target, input_ids=warm, max_new_tokens=8,
                         stop_token_ids=[tokenizer.eos_token_id], temperature=TEMPERATURE,
                         block_size=bs, return_stats=True)
@@ -98,71 +121,102 @@ def main() -> None:
         text = _apply_chat_template(tokenizer, [{"role": "user", "content": prompt}], False)
         input_ids = tokenizer.encode(text, return_tensors="pt").to(device)
 
-        base = dflash_generate(draft, target=target, input_ids=input_ids,
-                               max_new_tokens=MAX_NEW_TOKENS, stop_token_ids=[tokenizer.eos_token_id],
-                               temperature=TEMPERATURE, block_size=1, return_stats=True)
-        spec = dflash_generate(draft, target=target, input_ids=input_ids,
-                               max_new_tokens=MAX_NEW_TOKENS, stop_token_ids=[tokenizer.eos_token_id],
-                               temperature=TEMPERATURE, block_size=block_size, return_stats=True)
+        results = {}
+        for bs in BLOCK_SIZES:
+            results[bs] = dflash_generate(
+                draft, target=target, input_ids=input_ids,
+                max_new_tokens=MAX_NEW_TOKENS, stop_token_ids=[tokenizer.eos_token_id],
+                temperature=TEMPERATURE, block_size=bs, return_stats=True,
+            )
 
+        base = results[1]
         base_ids = base.output_ids[0, base.num_input_tokens:].tolist()
-        spec_ids = spec.output_ids[0, spec.num_input_tokens:].tolist()
-        # Longest common prefix as a losslessness probe (greedy => should be full match).
-        lcp = 0
-        for a, b in zip(base_ids, spec_ids):
-            if a != b:
-                break
-            lcp += 1
-        lossless = base_ids == spec_ids
+        base_tpot = base.time_per_output_token
 
-        speedup = base.time_per_output_token / spec.time_per_output_token
-        mean_acc = float(np.mean(spec.acceptance_lengths))
-        row = {
-            "idx": i,
-            "baseline_tpot_ms": round(base.time_per_output_token * 1e3, 3),
-            "dflash_tpot_ms": round(spec.time_per_output_token * 1e3, 3),
-            "decode_speedup": round(speedup, 3),
-            "mean_acceptance_length": round(mean_acc, 3),
-            "baseline_tokens": len(base_ids),
-            "dflash_tokens": len(spec_ids),
-            "lossless": lossless,
-            "lcp_over_min_len": round(lcp / max(1, min(len(base_ids), len(spec_ids))), 4),
-        }
+        row = {"idx": i, "baseline_tokens": len(base_ids)}
+        for bs in BLOCK_SIZES:
+            spec = results[bs]
+            spec_ids = spec.output_ids[0, spec.num_input_tokens:].tolist()
+            # Longest common prefix as a losslessness probe (greedy => should match).
+            lcp = 0
+            for a, b in zip(base_ids, spec_ids):
+                if a != b:
+                    break
+                lcp += 1
+            lossless = base_ids == spec_ids
+            speedup = base_tpot / spec.time_per_output_token
+            mean_acc = float(np.mean(spec.acceptance_lengths)) if spec.acceptance_lengths else 0.0
+            row[f"bs{bs}"] = {
+                "tpot_ms": round(spec.time_per_output_token * 1e3, 3),
+                "decode_speedup": round(speedup, 3),
+                "mean_acceptance_length": round(mean_acc, 3),
+                "tokens": len(spec_ids),
+                "lossless": lossless,
+                "lcp_over_min_len": round(lcp / max(1, min(len(base_ids), len(spec_ids))), 4),
+            }
         rows.append(row)
-        logger.info(f"[{i}] speedup={speedup:.2f}x  acc_len={mean_acc:.2f}  lossless={lossless}")
+        summary = "  ".join(
+            f"b{bs}:{row[f'bs{bs}']['decode_speedup']:.2f}x/acc{row[f'bs{bs}']['mean_acceptance_length']:.2f}"
+            for bs in BLOCK_SIZES
+        )
+        logger.info(f"[{i}] {summary}")
 
     with open(ART / "samples.jsonl", "w") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
 
-    base_tpot = float(np.mean([r["baseline_tpot_ms"] for r in rows]))
-    spec_tpot = float(np.mean([r["dflash_tpot_ms"] for r in rows]))
-    speedup = base_tpot / spec_tpot
-    mean_acc = float(np.mean([r["mean_acceptance_length"] for r in rows]))
-    lossless_frac = float(np.mean([1.0 if r["lossless"] else 0.0 for r in rows]))
-    base_tps = 1e3 / base_tpot
-    spec_tps = 1e3 / spec_tpot
+    # Aggregate per block size across samples.
+    sweep = []
+    for bs in BLOCK_SIZES:
+        tpots = [r[f"bs{bs}"]["tpot_ms"] for r in rows]
+        accs = [r[f"bs{bs}"]["mean_acceptance_length"] for r in rows]
+        losslessness = [1.0 if r[f"bs{bs}"]["lossless"] else 0.0 for r in rows]
+        mean_tpot = float(np.mean(tpots))
+        sweep.append({
+            "block_size": bs,
+            "tpot_ms": mean_tpot,
+            "tps": 1e3 / mean_tpot,
+            "mean_acceptance_length": float(np.mean(accs)),
+            "lossless_frac": float(np.mean(losslessness)),
+        })
+    baseline = next(s for s in sweep if s["block_size"] == 1)
+    for s in sweep:
+        s["decode_speedup"] = baseline["tpot_ms"] / s["tpot_ms"]
+
+    best = max(sweep, key=lambda s: s["decode_speedup"])
+
+    table_rows = "\n".join(
+        f"| {s['block_size']} | {s['tps']:.1f} | {s['decode_speedup']:.2f}x | "
+        f"{s['mean_acceptance_length']:.2f} | {s['lossless_frac'] * 100:.0f}% |"
+        for s in sweep
+    )
 
     md = f"""# DFlash PoC: {MODEL} + {DRAFT}
 
 Backend: Transformers ({attn}) | Dataset: {DATASET} | Samples: {len(rows)} | \
-block_size: {block_size} | temperature: {TEMPERATURE} | max_new_tokens: {MAX_NEW_TOKENS}
+draft.block_size: {draft_block_size} | temperature: {TEMPERATURE} | max_new_tokens: {MAX_NEW_TOKENS}
 
-## Core claim: lossless multi-token speculative acceleration
+## Inference-time block-size sweep
 
-| Metric | Value |
-|---|---|
-| Baseline (AR) throughput | {base_tps:.1f} tok/s |
-| DFlash throughput | {spec_tps:.1f} tok/s |
-| **Decode speedup** | **{speedup:.2f}x** |
-| **Mean acceptance length** (of {block_size}) | **{mean_acc:.2f}** |
-| Lossless (greedy output identical) | {lossless_frac * 100:.0f}% of samples |
+`dflash_generate` accepts any `block_size <= draft.block_size` against the same
+b{draft_block_size} draft. ``block_size=1`` is plain autoregressive decoding
+(baseline); larger sizes propose more tokens per verify step. The sweep below
+characterises the throughput vs. acceptance-length curve and identifies the
+practical sweet spot.
 
-- Both decoders use the same frozen target {MODEL}; only the drafting differs.
+| draft block_size | throughput (tok/s) | decode speedup vs. AR | mean acceptance length | lossless |
+|---|---|---|---|---|
+{table_rows}
+
+**Best speedup**: block_size={best['block_size']} at {best['decode_speedup']:.2f}x \
+(mean acceptance length {best['mean_acceptance_length']:.2f}).
+
+- Both decoders use the same frozen target {MODEL}; only the draft block size differs.
 - Acceptance length = mean tokens accepted per target forward pass. >1 means
-  the block-diffusion draft proposed multiple correct tokens at once.
-- Under greedy decoding DFlash is lossless by construction (verify step), so the
-  DFlash output should match the baseline output token for token.
+  the block-diffusion draft proposed multiple correct tokens at once. The
+  upper bound at block_size=k is k.
+- Under greedy decoding DFlash is lossless by construction (verify step), so
+  every DFlash output should match the baseline output token for token.
 
 Per-sample numbers in `samples.jsonl`.
 """
