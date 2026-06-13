@@ -67,7 +67,7 @@ def main() -> None:
         own argmax given the preceding context. ~1.0 => the sequence is a valid
         target greedy decode (i.e. the decoder that produced it was lossless)."""
         out = target(full_ids, use_cache=False)
-        pred = out.logits[0, :-1].argmax(dim=-1)  # prediction for position t+1
+        pred = out.logits[0, :-1].float().argmax(dim=-1)  # prediction for position t+1
         nxt = full_ids[0, 1:]
         gen = slice(gen_start - 1, full_ids.shape[1] - 1)  # positions predicting generated tokens
         return (pred[gen] == nxt[gen]).float().mean().item()
