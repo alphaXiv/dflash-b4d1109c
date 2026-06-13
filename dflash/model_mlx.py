@@ -503,8 +503,16 @@ def stream_generate(
                 )
                 if (trim_n := draft_cache[0].offset - (prompt.size + n - 1)) > 0:
                     _trim_recent_cache(draft_cache, trim_n)
-                draft_tokens = sampler(draft_logits)
+                if temperature > 0:
+                    scaled_draft_logits = draft_logits * (1.0 / temperature)
+                    draft_probs = mx.softmax(scaled_draft_logits, axis=-1)
+                    draft_tokens = mx.random.categorical(scaled_draft_logits)
+                else:
+                    draft_probs = None
+                    draft_tokens = sampler(draft_logits)
             mx.async_eval(draft_tokens)
+            if draft_probs is not None:
+                mx.async_eval(draft_probs)
 
             if _capture is not None:
                 _capture.clear()
@@ -512,12 +520,60 @@ def stream_generate(
                 verify_input = mx.concatenate([mx.array([[tokens[-1]]]), draft_tokens], axis=1)
                 logits = model(verify_input, target_cache)
                 hidden = mx.concatenate(model._hidden_states, axis=-1)
-                target_tokens = sampler(logits)
+                if temperature > 0:
+                    scaled_target_logits = logits * (1.0 / temperature)
+                    target_probs = mx.softmax(scaled_target_logits, axis=-1)
+                    target_tokens = mx.random.categorical(scaled_target_logits)
+                else:
+                    target_probs = None
+                    target_tokens = sampler(logits)
             mx.async_eval(target_tokens, hidden)
+            if target_probs is not None:
+                mx.async_eval(target_probs)
 
-            d_list, t_list = draft_tokens[0].tolist(), target_tokens[0].tolist()
-            accepted = next((i for i in range(len(d_list)) if d_list[i] != t_list[i]), len(d_list))
-            new_tokens = d_list[:accepted] + [t_list[accepted]]
+            d_list = draft_tokens[0].tolist()
+            n_drafts = len(d_list)
+            if temperature > 0:
+                # Speculative rejection sampling: accept token i with
+                # probability min(1, p_target(t_i) / p_draft(t_i)); on the
+                # first rejection, sample a corrected token from the
+                # residual distribution normalize(relu(p_target - p_draft))
+                # to preserve the target distribution.
+                draft_token_idx = draft_tokens[0][:, None]
+                p_draft = mx.take_along_axis(
+                    draft_probs[0], draft_token_idx, axis=-1
+                ).squeeze(-1)
+                p_target = mx.take_along_axis(
+                    target_probs[0, :n_drafts], draft_token_idx, axis=-1
+                ).squeeze(-1)
+                u = mx.random.uniform(shape=(n_drafts,))
+                accept_mask = (u * p_draft <= p_target).tolist()
+                accepted = next(
+                    (i for i, a in enumerate(accept_mask) if not a), n_drafts
+                )
+                if accepted < n_drafts:
+                    residual = mx.maximum(
+                        target_probs[0, accepted] - draft_probs[0, accepted], 0
+                    )
+                    # Fall back to the target distribution in the
+                    # degenerate (all-zero) case so we always have a
+                    # valid sampling distribution.
+                    residual = mx.where(
+                        mx.sum(residual) > 0, residual, target_probs[0, accepted]
+                    )
+                    correction = mx.random.categorical(
+                        mx.log(residual + 1e-30)
+                    ).item()
+                    new_tokens = d_list[:accepted] + [correction]
+                else:
+                    new_tokens = d_list + [target_tokens[0, -1].item()]
+            else:
+                t_list = target_tokens[0].tolist()
+                accepted = next(
+                    (i for i in range(n_drafts) if d_list[i] != t_list[i]),
+                    n_drafts,
+                )
+                new_tokens = d_list[:accepted] + [t_list[accepted]]
             new_tokens = new_tokens[:max_tokens - n]
 
             eos_idx = next((i for i, t in enumerate(new_tokens) if t in tokenizer.eos_token_ids), None)
